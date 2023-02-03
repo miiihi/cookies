@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"github.com/zellyn/kooky"
-	_ "github.com/zellyn/kooky/allbrowsers"
+	_ "github.com/zellyn/kooky/browser/all"
 )
 
 func contains(values []string, value string) bool {
@@ -23,38 +23,37 @@ func findCookies(url *url.URL, name string, browsers []string, logger *Logger) (
 	logger.Printf("Looking for cookies for URL %s", url)
 	filter := currentlyAppliesToURLAndName(url, name, logger.RequireVerbosity(2))
 
-	cookies := make(chan *kooky.Cookie)
+	c := make(chan []*kooky.Cookie)
+	cs := kooky.FindAllCookieStores()
+	logger.Printf("Found %d stores", len(cs))
+
+	done := make(chan struct{})
+
+	// append cookies
 	go func() {
-		kooky.ConcurrentlyVisitFinders(func(name string, finder kooky.CookieStoreFinder) {
-			if !contains(browsers, name) {
-				return
-			}
-			logger.Printf("Looking for %s cookie stores", name)
-			kooky.ConcurrentlyVisitStores(finder, func(store kooky.CookieStore) {
-				logger.Printf("Loading cookies from %v", store)
-				err := store.VisitCookies(func(cookie *kooky.Cookie, initializeValue kooky.CookieValueInitializer) error {
-					if !filter(cookie) {
-						return nil
-					}
-					err := initializeValue(cookie)
-					if err == nil {
-						cookies <- cookie
-					}
-					return err
-				})
-				if err != nil {
-					logger.Printf("Error loading cookies from %v: %s", store, err)
-				} else {
-					logger.Printf("Done loading cookies from %v", store)
-				}
-			})
-			logger.Printf("Done loading from %s cookie stores", name)
-		})
-		close(cookies)
+		for cookies := range c {
+			results = append(results, cookies...)
+		}
+		close(done)
 	}()
-	for cookie := range cookies {
-		results = append(results, cookie)
+
+	// read cookies
+	for _, store := range cs {
+		defer store.Close()
+
+		if !contains(browsers, store.Browser()) {
+			logger.Printf("Skipping %s", store.Browser())
+			continue
+		}
+		logger.Printf("Found %s", store.Browser())
+
+		cookies, err := store.ReadCookies(filter)
+		if err == nil && cookies != nil {
+			c <- cookies
+		}
 	}
+	close(c)
+
 	logger.Printf("Found %d matching cookie(s)", len(results))
 	return
 }
@@ -67,7 +66,7 @@ func currentlyAppliesToURLAndName(url *url.URL, name string, logger *Logger) koo
 
 func appliesToURLAndNameAtTime(url *url.URL, name string, time time.Time, logger *Logger) kooky.Filter {
 	urlIsNotSecure := url.Scheme != "https"
-	return func(cookie *kooky.Cookie) bool {
+	return kooky.FilterFunc(func(cookie *kooky.Cookie) bool {
 		if !hostMatchesDomain(url.Host, cookie.Domain) {
 			logger.Printf("Rejecting cookie for non-matching domain: %v", cookie)
 		} else if urlIsNotSecure && cookie.Secure {
@@ -83,7 +82,7 @@ func appliesToURLAndNameAtTime(url *url.URL, name string, time time.Time, logger
 			return true
 		}
 		return false
-	}
+	})
 }
 
 func hostMatchesDomain(host string, domain string) bool {
